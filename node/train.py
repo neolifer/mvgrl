@@ -2,9 +2,11 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
+import sys
+sys.path.append('..')
 from utils import sparse_mx_to_torch_sparse_tensor
-from node.dataset import load
-
+from dataset import load
+from tqdm import tqdm
 
 # Borrowed from https://github.com/PetarV-/DGI
 class GCN(nn.Module):
@@ -91,6 +93,9 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.gcn1 = GCN(n_in, n_h)
         self.gcn2 = GCN(n_in, n_h)
+
+        # self.gcn3 = GCN(n_h, n_h)
+        # self.gcn4 = GCN(n_h, n_h)
         self.read = Readout()
 
         self.sigm = nn.Sigmoid()
@@ -99,15 +104,20 @@ class Model(nn.Module):
 
     def forward(self, seq1, seq2, adj, diff, sparse, msk, samp_bias1, samp_bias2):
         h_1 = self.gcn1(seq1, adj, sparse)
+        # h_1 = self.gcn3(h_1, adj, sparse)
         c_1 = self.read(h_1, msk)
         c_1 = self.sigm(c_1)
 
         h_2 = self.gcn2(seq1, diff, sparse)
+        # h_2 = self.gcn4(h_2, diff, sparse)
         c_2 = self.read(h_2, msk)
         c_2 = self.sigm(c_2)
 
         h_3 = self.gcn1(seq2, adj, sparse)
+        # h_3 = self.gcn3(h_3, adj, sparse)
         h_4 = self.gcn2(seq2, diff, sparse)
+        # h_4 = self.gcn4(h_4, diff, sparse)
+
 
         ret = self.disc(c_1, c_2, h_1, h_2, h_3, h_4, samp_bias1, samp_bias2)
 
@@ -115,9 +125,11 @@ class Model(nn.Module):
 
     def embed(self, seq, adj, diff, sparse, msk):
         h_1 = self.gcn1(seq, adj, sparse)
+        # h_1 = self.gcn3(h_1, adj, sparse)
         c = self.read(h_1, msk)
 
         h_2 = self.gcn2(seq, diff, sparse)
+        # h_2 = self.gcn4(h_2, diff, sparse)
         return (h_1 + h_2).detach(), c.detach()
 
 
@@ -151,7 +163,12 @@ def train(dataset, verbose=False):
     sparse = False
 
     adj, diff, features, labels, idx_train, idx_val, idx_test = load(dataset)
-
+    # diff = torch.FloatTensor(diff)
+    # torch.save(diff,'diff.pt')
+    # sys.exit()
+    diff = torch.load('data/cora/Cora_gnnexplainer_edge_value_adj.pt')
+    # print(diff.max())
+    # sys.exit()
     ft_size = features.shape[1]
     nb_classes = np.unique(labels).shape[0]
 
@@ -181,8 +198,13 @@ def train(dataset, verbose=False):
     cnt_wait = 0
     best = 1e9
     best_t = 0
-
-    for epoch in range(nb_epochs):
+    # features = torch.FloatTensor(features[np.newaxis])
+    # adj = torch.FloatTensor(adj[np.newaxis])
+    # diff = torch.FloatTensor(diff[np.newaxis])
+    # features = features.cuda()
+    # adj = adj.cuda()
+    # diff = diff.cuda()
+    for epoch in tqdm(range(nb_epochs)):
 
         idx = np.random.randint(0, adj.shape[-1] - sample_size + 1, batch_size)
         ba, bd, bf = [], [], []
@@ -192,8 +214,8 @@ def train(dataset, verbose=False):
             bf.append(features[i: i + sample_size])
 
         ba = np.array(ba).reshape(batch_size, sample_size, sample_size)
-        bd = np.array(bd).reshape(batch_size, sample_size, sample_size)
-        bf = np.array(bf).reshape(batch_size, sample_size, ft_size)
+        bd = np.stack(bd, axis = 0)
+        bf = np.stack(bf, axis = 0)
 
         if sparse:
             ba = sparse_mx_to_torch_sparse_tensor(sp.coo_matrix(ba))
@@ -284,14 +306,16 @@ def train(dataset, verbose=False):
 
     accs = torch.stack(accs)
     print(accs.mean().item(), accs.std().item())
-
+    return(accs.mean().item())
 
 if __name__ == '__main__':
     import warnings
     warnings.filterwarnings("ignore")
-    torch.cuda.set_device(3)
+    torch.cuda.set_device(0)
 
     # 'cora', 'citeseer', 'pubmed'
     dataset = 'cora'
+    acc = 0
     for __ in range(50):
-        train(dataset)
+        acc += train(dataset)
+    print('average acc over 50 runs:',acc/50)
