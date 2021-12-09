@@ -2,8 +2,13 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import torch.nn as nn
+import sys
+sys.path.append('..')
 from utils import sparse_mx_to_torch_sparse_tensor
-from node.dataset import load
+from dataset import load
+from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+import torch.nn.functional as F
 
 
 # Borrowed from https://github.com/PetarV-/DGI
@@ -69,6 +74,7 @@ class Discriminator(nn.Module):
                 m.bias.data.fill_(0.0)
 
     def forward(self, c1, c2, h1, h2, h3, h4, s_bias1=None, s_bias2=None):
+
         c_x1 = torch.unsqueeze(c1, 1)
         c_x1 = c_x1.expand_as(h1).contiguous()
         c_x2 = torch.unsqueeze(c2, 1)
@@ -78,12 +84,55 @@ class Discriminator(nn.Module):
         sc_1 = torch.squeeze(self.f_k(h2, c_x1), 2)
         sc_2 = torch.squeeze(self.f_k(h1, c_x2), 2)
 
+        # sc_1 = (h2*c_x1).sum(2)
+        # sc_2 = (h1*c_x2).sum(2)
+
+
         # negetive
         sc_3 = torch.squeeze(self.f_k(h4, c_x1), 2)
         sc_4 = torch.squeeze(self.f_k(h3, c_x2), 2)
+        # sc_3 = (h4*c_x1).sum(2)
+        # sc_4 = (h3*c_x2).sum(2)
 
         logits = torch.cat((sc_1, sc_2, sc_3, sc_4), 1)
+        # logits = torch.cat((sc_3, sc_4), 1)
         return logits
+
+    def supervised(self, h1, h2, c1, c2, c3, c4):
+        c_x1 = []
+        c_x2 = []
+        c_x3 = []
+        c_x4 = []
+        for i in range(len(h1)):
+            c_x1.append(torch.unsqueeze(c1[i], 1).expand_as(h2[i]).contiguous())
+            c_x2.append(torch.unsqueeze(c2[i], 1).expand_as(h1[i]).contiguous())
+            c_x3.append(torch.unsqueeze(c3[i], 1).expand_as(h2[i]).contiguous())
+            c_x4.append(torch.unsqueeze(c4[i], 1).expand_as(h1[i]).contiguous())
+
+        #positive
+        sc1 = []
+        sc2 = []
+        for i in range(len(h1)):
+            # print(h2[i].shape, c_x1[i].shape, h1[i].shape, c_x2[i].shape)
+            sc1.append(torch.squeeze(self.f_k(h2[i], c_x1[i]), 2))
+            sc2.append(torch.squeeze(self.f_k(h1[i], c_x2[i]), 2))
+
+        #negative
+        sc3 = []
+        sc4 = []
+        for i in range(len(h1)):
+            # print(h2[i].shape, c_x3[i].shape, h1[i].shape, c_x4[i].shape)
+            sc3.append(torch.squeeze(self.f_k(h2[i], c_x3[i]), 2))
+            sc4.append(torch.squeeze(self.f_k(h1[i], c_x4[i]), 2))
+        # print(sc1[0].shape)
+        # sys.exit()
+        sc_1 = torch.cat(sc1, dim = 1)
+        sc_2 = torch.cat(sc2, dim = 1)
+        sc_3 = torch.cat(sc3, dim = 1)
+        sc_4 = torch.cat(sc4, dim = 1)
+
+        return torch.cat([sc_1, sc_2], dim = 1)
+
 
 
 class Model(nn.Module):
@@ -91,33 +140,60 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.gcn1 = GCN(n_in, n_h)
         self.gcn2 = GCN(n_in, n_h)
+
+        # self.gcn3 = GCN(n_h, n_h)
+        # self.gcn4 = GCN(n_h, n_h)
         self.read = Readout()
 
         self.sigm = nn.Sigmoid()
 
         self.disc = Discriminator(n_h)
 
-    def forward(self, seq1, seq2, adj, diff, sparse, msk, samp_bias1, samp_bias2):
+    def forward(self, seq1, seq2, adj, diff, sparse, msk, samp_bias1, samp_bias2, indices_pos = None, indices_neg = None):
         h_1 = self.gcn1(seq1, adj, sparse)
+        # h_1 = self.gcn3(h_1, adj, sparse)
         c_1 = self.read(h_1, msk)
         c_1 = self.sigm(c_1)
 
         h_2 = self.gcn2(seq1, diff, sparse)
+        # h_2 = self.gcn4(h_2, diff, sparse)
         c_2 = self.read(h_2, msk)
         c_2 = self.sigm(c_2)
 
         h_3 = self.gcn1(seq2, adj, sparse)
+        # h_3 = self.gcn3(h_3, adj, sparse)
         h_4 = self.gcn2(seq2, diff, sparse)
-
+        # h_4 = self.gcn4(h_4, diff, sparse)
+        #
+        h_1s = []
+        h_2s = []
+        c_1s = []
+        c_2s = []
+        c_3s = []
+        c_4s = []
+        for i in range(len(indices_neg)):
+            h_1s.append(h_1[:,indices_pos[i],:])
+            h_2s.append(h_2[:,indices_pos[i],:])
+            c_1s.append(self.sigm(self.read(h_1[:,indices_pos[i],:], msk)))
+            c_2s.append(self.sigm(self.read(h_2[:,indices_pos[i],:], msk)))
+            c_3s.append(self.sigm(self.read(h_1[:,indices_neg[i],:], msk)))
+            c_4s.append(self.sigm(self.read(h_2[:,indices_neg[i],:], msk)))
+            print(torch.cdist(c_1s[i], c_1))
+            sys.exit()
         ret = self.disc(c_1, c_2, h_1, h_2, h_3, h_4, samp_bias1, samp_bias2)
-
+        ret2 = self.disc.supervised(h_1s, h_2s, c_1s, c_2s, c_3s, c_4s)
+        #
+        #
+        # ret = torch.cat((ret2, ret), 1)
         return ret, h_1, h_2
 
     def embed(self, seq, adj, diff, sparse, msk):
         h_1 = self.gcn1(seq, adj, sparse)
+        # h_1 = self.gcn3(h_1, adj, sparse)
         c = self.read(h_1, msk)
 
         h_2 = self.gcn2(seq, diff, sparse)
+        # h_2 = self.gcn4(h_2, diff, sparse)
         return (h_1 + h_2).detach(), c.detach()
 
 
@@ -152,11 +228,20 @@ def train(dataset, verbose=False):
 
     adj, diff, features, labels, idx_train, idx_val, idx_test = load(dataset)
 
+
+
+    diff[diff < 1e-3] = 0
+    # diff = torch.FloatTensor(diff)
+    # torch.save(diff,'diff.pt')
+    # sys.exit()
+    # diff = torch.load('data/cora/Cora_gnnexplainer_edge_value_adj.pt')
+    # print(diff.max())
+    # sys.exit()
     ft_size = features.shape[1]
     nb_classes = np.unique(labels).shape[0]
 
     sample_size = 2000
-    batch_size = 4
+    batch_size = 1
 
     labels = torch.LongTensor(labels)
     idx_train = torch.LongTensor(idx_train)
@@ -181,19 +266,30 @@ def train(dataset, verbose=False):
     cnt_wait = 0
     best = 1e9
     best_t = 0
-
-    for epoch in range(nb_epochs):
+    # features = torch.FloatTensor(features[np.newaxis])
+    # adj = torch.FloatTensor(adj[np.newaxis])
+    # diff = torch.FloatTensor(diff[np.newaxis])
+    # features = features.cuda()
+    # adj = adj.cuda()
+    # diff = diff.cuda()
+    writer = SummaryWriter('./path/to/log')
+    for epoch in tqdm(range(nb_epochs)):
 
         idx = np.random.randint(0, adj.shape[-1] - sample_size + 1, batch_size)
         ba, bd, bf = [], [], []
+        idx_train_epo = []
+        labels_epo = []
+
         for i in idx:
             ba.append(adj[i: i + sample_size, i: i + sample_size])
             bd.append(diff[i: i + sample_size, i: i + sample_size])
             bf.append(features[i: i + sample_size])
-
+            idx_train_epo.append(np.intersect1d(idx_train.cpu(), list(range(i, i + sample_size))))
+            labels_epo.append(labels[i:i+sample_size])
         ba = np.array(ba).reshape(batch_size, sample_size, sample_size)
-        bd = np.array(bd).reshape(batch_size, sample_size, sample_size)
-        bf = np.array(bf).reshape(batch_size, sample_size, ft_size)
+        bd = np.stack(bd, axis = 0)
+        bf = np.stack(bf, axis = 0)
+
 
         if sparse:
             ba = sparse_mx_to_torch_sparse_tensor(sp.coo_matrix(ba))
@@ -205,23 +301,30 @@ def train(dataset, verbose=False):
         bf = torch.FloatTensor(bf)
         idx = np.random.permutation(sample_size)
         shuf_fts = bf[:, idx, :]
+        indices_pos = []
+        indices_neg = []
+        for i in range(len(labels_epo)):
+            labels_type = torch.unique(labels_epo[i])
+            for label in labels_type:
+                indices_pos.append(labels_epo[i] == label)
+                indices_neg.append(labels_epo[i] != label)
 
         if torch.cuda.is_available():
             bf = bf.cuda()
             ba = ba.cuda()
             bd = bd.cuda()
             shuf_fts = shuf_fts.cuda()
-
+            lbl_2 = lbl_2.cuda()
         model.train()
         optimiser.zero_grad()
 
-        logits, __, __ = model(bf, shuf_fts, ba, bd, sparse, None, None, None)
+        logits, __, __ = model(bf, shuf_fts, ba, bd, sparse, None, None, None, indices_pos, indices_neg)
 
         loss = b_xent(logits, lbl)
-
         loss.backward()
         optimiser.step()
 
+        # writer.add_scalar('loss', loss, epoch)
         if verbose:
             print('Epoch: {0}, Loss: {1:0.4f}'.format(epoch, loss.item()))
 
@@ -284,14 +387,16 @@ def train(dataset, verbose=False):
 
     accs = torch.stack(accs)
     print(accs.mean().item(), accs.std().item())
-
+    return(accs.mean().item())
 
 if __name__ == '__main__':
     import warnings
     warnings.filterwarnings("ignore")
-    torch.cuda.set_device(3)
+    torch.cuda.set_device(0)
 
     # 'cora', 'citeseer', 'pubmed'
     dataset = 'cora'
+    acc = 0
     for __ in range(50):
-        train(dataset)
+        acc += train(dataset)
+    print('average acc over 50 runs:',acc/50)
